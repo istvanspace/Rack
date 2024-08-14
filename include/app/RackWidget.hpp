@@ -141,6 +141,9 @@ struct RackWidget : widget::OpaqueWidget {
 	void setTouchedParam(ParamWidget* pw);
 
 	PRIVATE void updateExpanders();
+
+	void addCableFromJson(json_t* cableJ);
+	void addModuleFromJson(json_t* moduleJ);
 };
 
 

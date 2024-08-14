@@ -44,3 +44,7 @@
 [submodule "dep/simde"]
 	path = dep/simde
 	url = https://github.com/simd-everywhere/simde.git
+[submodule "dep/serial"]
+	path = dep/serial
+	url = https://github.com/wjwwood/serial.git
+	ignore = untracked

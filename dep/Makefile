@@ -18,6 +18,7 @@ ifdef ARCH_LIN
 	libsamplerate = lib/libsamplerate.a
 	rtmidi = lib/librtmidi.a
 	rtaudio = lib/librtaudio.a
+	serial = lib/libserial.a
 endif
 
 ifdef ARCH_MAC
@@ -32,6 +33,7 @@ ifdef ARCH_MAC
 	libsamplerate = lib/libsamplerate.a
 	rtmidi = lib/librtmidi.a
 	rtaudio = lib/librtaudio.a
+	serial = lib/libserial.a
 endif
 
 ifdef ARCH_WIN
@@ -46,6 +48,7 @@ ifdef ARCH_WIN
 	libsamplerate = lib/libsamplerate.a
 	rtmidi = lib/librtmidi.a
 	rtaudio = lib/librtaudio.a
+	serial = lib/libserial.a
 endif
 
 nanovg = include/nanovg.h
@@ -76,7 +79,7 @@ DEPS += $(fuzzysearchdatabase)
 DEPS += $(ghcfilesystem)
 DEPS += $(tinyexpr)
 DEPS += $(simde)
-
+DEPS += $(serial)
 
 DEP_LOCAL := .
 include $(RACK_DIR)/dep.mk
@@ -262,9 +265,15 @@ $(simde): simde/simde
 	mkdir -p include
 	cp -R $^ include/
 
+$(serial): | serial
+	cd serial && mkdir -p build
+	cd serial/build && $(CMAKE) .. -DBUILD_SHARED_LIBS=OFF
+	$(MAKE) -C serial/build
+	$(MAKE) -C serial/build install
+
 # Helpers
 
-src: glew-2.1.0 glfw jansson-2.12 libsamplerate-0.1.9 openssl-1.1.1k curl-7.79.1 zstd-1.4.5 libarchive-3.4.3 rtaudio nanovg nanosvg oui-blendish osdialog
+src: glew-2.1.0 glfw jansson-2.12 libsamplerate-0.1.9 openssl-1.1.1k curl-7.79.1 zstd-1.4.5 libarchive-3.4.3 rtaudio nanovg nanosvg oui-blendish osdialog serial
 
 clean:
 	git clean -fdx

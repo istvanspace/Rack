@@ -1,4 +1,9 @@
 #include <thread>
+#include <vector>
+#include <atomic>
+#include <string>
+#include <algorithm>
+#include "serial/serial.h"
 
 #include <osdialog.h>
 
@@ -13,6 +18,9 @@
 #include <settings.hpp>
 #include <patch.hpp>
 #include <asset.hpp>
+#include <queue>
+#include <mutex>
+#include <functional>
 
 
 namespace rack {
@@ -49,6 +57,12 @@ struct Scene::Internal {
 	double lastAutosaveTime = 0.0;
 
 	bool heldArrowKeys[4] = {};
+
+	// New members for serial communication
+    std::vector<std::thread> serialThreads;
+    std::atomic<bool> running{true};
+	std::queue<std::function<void()>> taskQueue;
+    std::mutex taskMutex;
 };
 
 
@@ -75,11 +89,21 @@ Scene::Scene() {
 	internal->resizeHandle->box.size = math::Vec(15, 15);
 	internal->resizeHandle->hide();
 	addChild(internal->resizeHandle);
+
+	// Start serial communication threads
+    startSerialThreads();
 }
 
 
 Scene::~Scene() {
-	delete internal;
+	// Stop all serial threads
+    internal->running = false;
+    for (auto& thread : internal->serialThreads) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+    delete internal;
 }
 
 
@@ -142,6 +166,19 @@ void Scene::step() {
 
 		rackScroll->offset += arrowDelta * arrowSpeed;
 	}
+
+	// Process tasks from background threads
+    std::function<void()> task;
+    {
+        std::lock_guard<std::mutex> lock(internal->taskMutex);
+        if (!internal->taskQueue.empty()) {
+            task = internal->taskQueue.front();
+            internal->taskQueue.pop();
+        }
+    }
+    if (task) {
+        task();
+    }
 
 	Widget::step();
 }
@@ -296,6 +333,12 @@ void Scene::onHoverKey(const HoverKeyEvent& e) {
 				e.consume(this);
 			}
 		}
+		// Handle DigiMod-specific key press: Ctrl+H
+		if (e.keyName == "h" && (e.mods & RACK_MOD_MASK) == RACK_MOD_CTRL) {
+			addVcoModule();
+			WARN("addVcoModule()");
+			e.consume(this);
+		}
 	}
 
 	// Scroll RackScrollWidget with arrow keys
@@ -363,6 +406,136 @@ void Scene::onPathDrop(const PathDropEvent& e) {
 	}
 
 	OpaqueWidget::onPathDrop(e);
+}
+
+void Scene::startSerialThreads() {
+    std::vector<serial::PortInfo> devices = serial::list_ports();
+    for (const auto& device : devices) {
+        if (device.hardware_id.find("Arduino") != std::string::npos) {
+            internal->serialThreads.emplace_back(&Scene::serialThread, this, device.port);
+        }
+    }
+}
+
+void Scene::serialThread(std::string port) {
+    serial::Serial serial_port(port, 9600, serial::Timeout::simpleTimeout(1000));
+    
+    while (internal->running) {
+        if (serial_port.available()) {
+            std::string msg = serial_port.readline();
+            std::transform(msg.begin(), msg.end(), msg.begin(), ::tolower);
+            if (msg.find("execute") != std::string::npos) {
+                std::lock_guard<std::mutex> lock(internal->taskMutex);
+                internal->taskQueue.push([this]() { addVcoModule(); });
+            }
+        }
+    }
+}
+
+void Scene::addVcoModule() {
+    // Create the rootJ object
+    json_t *rootJ = json_object();
+
+    // Create the modules array
+    json_t *modules = json_array();
+
+    // Create the first module object
+    json_t *module = json_object();
+
+    // Set the module properties
+    json_object_set_new(module, "plugin", json_string("Fundamental"));
+    json_object_set_new(module, "model", json_string("VCO"));
+    json_object_set_new(module, "version", json_string("2.6.0"));
+    json_object_set_new(module, "id", json_integer(-1));
+
+    // Create the params array
+    json_t *params = json_array();
+
+    // Add params to the array
+    json_t *param0 = json_object();
+    json_object_set_new(param0, "value", json_real(0.0));
+    json_object_set_new(param0, "id", json_integer(0));
+    json_array_append_new(params, param0);
+
+    json_t *param1 = json_object();
+    json_object_set_new(param1, "value", json_real(1.0));
+    json_object_set_new(param1, "id", json_integer(1));
+    json_array_append_new(params, param1);
+
+    json_t *param2 = json_object();
+    json_object_set_new(param2, "value", json_real(1.0));
+    json_object_set_new(param2, "id", json_integer(2));
+    json_array_append_new(params, param2);
+
+    json_t *param3 = json_object();
+    json_object_set_new(param3, "value", json_real(0.0));
+    json_object_set_new(param3, "id", json_integer(3));
+    json_array_append_new(params, param3);
+
+    json_t *param4 = json_object();
+    json_object_set_new(param4, "value", json_real(0.0));
+    json_object_set_new(param4, "id", json_integer(4));
+    json_array_append_new(params, param4);
+
+    json_t *param5 = json_object();
+    json_object_set_new(param5, "value", json_real(0.5));
+    json_object_set_new(param5, "id", json_integer(5));
+    json_array_append_new(params, param5);
+
+    json_t *param6 = json_object();
+    json_object_set_new(param6, "value", json_real(0.0));
+    json_object_set_new(param6, "id", json_integer(6));
+    json_array_append_new(params, param6);
+
+    json_t *param7 = json_object();
+    json_object_set_new(param7, "value", json_real(0.0));
+    json_object_set_new(param7, "id", json_integer(7));
+    json_array_append_new(params, param7);
+
+    // Add params array to module object
+    json_object_set_new(module, "params", params);
+
+    // Create and add pos array to module object
+    json_t *pos = json_array();
+    json_array_append_new(pos, json_integer(39));
+    json_array_append_new(pos, json_integer(0));
+    json_object_set_new(module, "pos", pos);
+
+    // Add module object to modules array
+    json_array_append_new(modules, module);
+
+    // Add modules array to rootJ object
+    json_object_set_new(rootJ, "modules", modules);
+
+    // Create an empty cables array and add it to rootJ object
+    json_t *cables = json_array();
+
+    // Create a new cable object
+    json_t *cable = json_object();
+    json_object_set_new(cable, "id", json_integer(-1));
+    json_object_set_new(cable, "outputModuleId", json_integer(2));
+    json_object_set_new(cable, "outputId", json_integer(0));
+    json_object_set_new(cable, "inputModuleId", json_integer(7));
+    json_object_set_new(cable, "inputId", json_integer(1));
+    json_object_set_new(cable, "color", json_string("#f3374b"));
+    json_array_append_new(cables, cable);
+
+    // Add cables array to rootJ object
+    json_object_set_new(rootJ, "cables", cables);
+
+    // Log the event
+    WARN("Button pressed: Ctrl+H");
+
+    // Add the module to the scene
+    if (APP && APP->scene && APP->scene->rack) {
+		APP->scene->rack->addModuleFromJson(module);
+        APP->scene->rack->addCableFromJson(cable);
+    } else {
+        WARN("Scene or Rack is not initialized");
+    }
+
+    // Cleanup the JSON object
+    json_decref(rootJ);
 }
 
 

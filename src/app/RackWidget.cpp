@@ -1587,6 +1587,99 @@ void RackWidget::updateExpanders() {
 	}
 }
 
+void RackWidget::addModuleFromJson(json_t* moduleJ) {
+    // Create a new ModuleWidget from JSON
+    ModuleWidget* moduleWidget = moduleWidgetFromJson(moduleJ);
+    if (!moduleWidget) {
+        WARN("Failed to create module from JSON.");
+        return;
+    }
+
+    // Add the module to the engine
+    APP->engine->addModule(moduleWidget->module);
+
+    // Get the position from JSON
+    json_t* posJ = json_object_get(moduleJ, "pos");
+    double x = 0.0, y = 0.0;
+    json_unpack(posJ, "[F, F]", &x, &y);
+    math::Vec pos = math::Vec(x, y).mult(RACK_GRID_SIZE).plus(RACK_OFFSET);
+    setModulePosForce(moduleWidget, pos);
+
+    // Add the ModuleWidget to the module container
+    internal->moduleContainer->addChild(moduleWidget);
+    updateExpanders();
+
+    INFO("Module added from JSON: %s", moduleWidget->module->model->getFullName().c_str());
+}
+
+void RackWidget::addCableFromJson(json_t* cableJ) {
+    // Get cable ID from JSON (optional)
+    json_t* idJ = json_object_get(cableJ, "id");
+    int64_t id = idJ ? json_integer_value(idJ) : -1;
+
+    // Get the module and port IDs involved
+    json_t* outputModuleIdJ = json_object_get(cableJ, "outputModuleId");
+    json_t* inputModuleIdJ = json_object_get(cableJ, "inputModuleId");
+    json_t* outputPortIdJ = json_object_get(cableJ, "outputId");
+    json_t* inputPortIdJ = json_object_get(cableJ, "inputId");
+
+    int64_t outputModuleId = json_integer_value(outputModuleIdJ);
+    int64_t inputModuleId = json_integer_value(inputModuleIdJ);
+    int64_t outputPortId = json_integer_value(outputPortIdJ);
+    int64_t inputPortId = json_integer_value(inputPortIdJ);
+
+    ModuleWidget* outputModuleWidget = getModule(outputModuleId);
+    ModuleWidget* inputModuleWidget = getModule(inputModuleId);
+
+    if (!outputModuleWidget || !inputModuleWidget) {
+        WARN("Failed to find modules for cable creation.");
+        return;
+    }
+
+    // Retrieve the output and input ports
+    PortWidget* outputPortWidget = nullptr;
+    PortWidget* inputPortWidget = nullptr;
+
+    for (PortWidget* portWidget : outputModuleWidget->getPorts()) {
+        if (portWidget->type == engine::Port::OUTPUT && portWidget->portId == outputPortId) {
+            outputPortWidget = portWidget;
+            break;
+        }
+    }
+
+    for (PortWidget* portWidget : inputModuleWidget->getPorts()) {
+        if (portWidget->type == engine::Port::INPUT && portWidget->portId == inputPortId) {
+            inputPortWidget = portWidget;
+            break;
+        }
+    }
+
+    if (!outputPortWidget || !inputPortWidget) {
+        WARN("Failed to find matching ports for cable creation.");
+        return;
+    }
+
+    // Create the cable and add it to the engine
+    engine::Cable* cable = new engine::Cable;
+    cable->id = id;
+    cable->outputModule = outputModuleWidget->module;
+    cable->outputId = outputPortId;
+    cable->inputModule = inputModuleWidget->module;
+    cable->inputId = inputPortId;
+
+    APP->engine->addCable(cable);
+
+    // Create the CableWidget and add it to the RackWidget
+    CableWidget* cableWidget = new CableWidget;
+    cableWidget->setCable(cable);
+    cableWidget->outputPort = outputPortWidget;
+    cableWidget->inputPort = inputPortWidget;
+    cableWidget->fromJson(cableJ);
+    addCable(cableWidget);
+
+    INFO("Cable added from JSON with id: %lld", (long long)cable->id);
+}
+
 
 } // namespace app
 } // namespace rack

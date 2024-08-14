@@ -3,7 +3,9 @@ EDITION := Free
 VERSION_MAJOR := 2
 VERSION := $(shell jq -r .version Core.json)
 
-FLAGS += -Iinclude -Idep/include
+SERIAL_LIB := dep/serial/build/libserial.a
+
+FLAGS += -Iinclude -Idep/include -Idep/serial/include
 
 include arch.mk
 
@@ -35,7 +37,7 @@ ifdef ARCH_LIN
 
 	LDFLAGS += -Wl,--whole-archive
 	LDFLAGS += -static-libstdc++ -static-libgcc
-	LDFLAGS += dep/lib/libGLEW.a dep/lib/libglfw3.a dep/lib/libjansson.a dep/lib/libcurl.a dep/lib/libssl.a dep/lib/libcrypto.a dep/lib/libarchive.a dep/lib/libzstd.a dep/lib/libspeexdsp.a dep/lib/libsamplerate.a dep/lib/librtmidi.a dep/lib/librtaudio.a
+	LDFLAGS += dep/lib/libGLEW.a dep/lib/libglfw3.a dep/lib/libjansson.a dep/lib/libcurl.a dep/lib/libssl.a dep/lib/libcrypto.a dep/lib/libarchive.a dep/lib/libzstd.a dep/lib/libspeexdsp.a dep/lib/libsamplerate.a dep/lib/librtmidi.a dep/lib/librtaudio.a $(SERIAL_LIB)
 	LDFLAGS += -Wl,--no-whole-archive
 	LDFLAGS += -lpthread -lGL -ldl -lX11 -lasound -ljack -lpulse -lpulse-simple
 endif
@@ -99,10 +101,13 @@ ifdef ARCH_WIN
 	STANDALONE_OBJECTS += build/Rack.res
 endif
 
-STANDALONE_OBJECTS += $(TARGET)
+STANDALONE_OBJECTS += $(TARGET) $(SERIAL_LIB)
 
 $(STANDALONE_TARGET): $(STANDALONE_SOURCES) $(STANDALONE_OBJECTS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(STANDALONE_LDFLAGS)
+
+$(SERIAL_LIB):
+	$(MAKE) -C dep/serial
 
 # Convenience targets
 
@@ -110,6 +115,7 @@ all: $(TARGET) $(STANDALONE_TARGET)
 
 dep:
 	$(MAKE) -C dep
+	$(MAKE) -C dep/serial
 
 cleandep:
 	$(MAKE) -C dep clean

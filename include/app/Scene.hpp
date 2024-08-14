@@ -3,6 +3,7 @@
 #include <widget/OpaqueWidget.hpp>
 #include <app/RackScrollWidget.hpp>
 #include <app/RackWidget.hpp>
+#include <string>
 
 
 namespace rack {
@@ -12,6 +13,7 @@ namespace app {
 struct Scene : widget::OpaqueWidget {
 	struct Internal;
 	Internal* internal;
+
 
 	// Convenience variables for accessing important widgets
 	RackScrollWidget* rackScroll;
@@ -33,6 +35,14 @@ struct Scene : widget::OpaqueWidget {
 	void onDragHover(const DragHoverEvent& e) override;
 	void onHoverKey(const HoverKeyEvent& e) override;
 	void onPathDrop(const PathDropEvent& e) override;
+
+	// DigiMod methods
+
+	void addVcoModule();
+
+	// New methods for serial communication
+    void startSerialThreads();
+    void serialThread(std::string port);
 };
 
 
