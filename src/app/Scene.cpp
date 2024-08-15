@@ -339,6 +339,14 @@ void Scene::onHoverKey(const HoverKeyEvent& e) {
 			WARN("addVcoModule()");
 			e.consume(this);
 		}
+		if (e.action == GLFW_PRESS && e.key == GLFW_KEY_F2) {
+			std::lock_guard<std::mutex> lock(internal->taskMutex);
+			internal->taskQueue.push([this]() { 
+				addVcoModule(); 
+				INFO("VCO module added via F2 key press");
+			});
+			e.consume(this);
+		}
 	}
 
 	// Scroll RackScrollWidget with arrow keys
@@ -411,24 +419,38 @@ void Scene::onPathDrop(const PathDropEvent& e) {
 void Scene::startSerialThreads() {
     std::vector<serial::PortInfo> devices = serial::list_ports();
     for (const auto& device : devices) {
-        if (device.hardware_id.find("Arduino") != std::string::npos) {
+        if (device.hardware_id.find("Arduino") != std::string::npos || 
+            device.description.find("Arduino") != std::string::npos) {
+            INFO("Found Arduino on port: %s", device.port.c_str());
             internal->serialThreads.emplace_back(&Scene::serialThread, this, device.port);
+            break;  // Assuming we only want to use the first Arduino found
         }
+    }
+    if (internal->serialThreads.empty()) {
+        WARN("No Arduino found. Serial communication disabled.");
     }
 }
 
 void Scene::serialThread(std::string port) {
-    serial::Serial serial_port(port, 9600, serial::Timeout::simpleTimeout(1000));
-    
-    while (internal->running) {
-        if (serial_port.available()) {
-            std::string msg = serial_port.readline();
-            std::transform(msg.begin(), msg.end(), msg.begin(), ::tolower);
-            if (msg.find("execute") != std::string::npos) {
-                std::lock_guard<std::mutex> lock(internal->taskMutex);
-                internal->taskQueue.push([this]() { addVcoModule(); });
+    try {
+        serial::Serial serial_port(port, 9600, serial::Timeout::simpleTimeout(1000));
+        
+        while (internal->running) {
+            if (serial_port.available()) {
+                std::string msg = serial_port.readline();
+                std::transform(msg.begin(), msg.end(), msg.begin(), ::tolower);
+                if (msg.find("execute") != std::string::npos) {
+                    std::lock_guard<std::mutex> lock(internal->taskMutex);
+                    internal->taskQueue.push([this]() { 
+                        addVcoModule(); 
+                        INFO("VCO module added via Arduino button press");
+                    });
+                }
             }
         }
+    }
+    catch (serial::IOException& e) {
+        WARN("Failed to open serial port: %s", e.what());
     }
 }
 
@@ -523,13 +545,11 @@ void Scene::addVcoModule() {
     // Add cables array to rootJ object
     json_object_set_new(rootJ, "cables", cables);
 
-    // Log the event
-    WARN("Button pressed: Ctrl+H");
-
     // Add the module to the scene
     if (APP && APP->scene && APP->scene->rack) {
 		APP->scene->rack->addModuleFromJson(module);
         APP->scene->rack->addCableFromJson(cable);
+		INFO("VCO module added to rack");
     } else {
         WARN("Scene or Rack is not initialized");
     }
