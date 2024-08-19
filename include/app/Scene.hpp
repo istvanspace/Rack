@@ -41,6 +41,7 @@ struct Scene : widget::OpaqueWidget {
 
 	void serialAcknowledgment(serial::Serial& serial_port, const uint8_t* buffer, size_t bufferSize, bool success);
 	bool addVcoModule(const char* payload1, const char* payload2);
+	bool updateModuleParameter(int64_t moduleId, int paramId, float normalizedValue);
 
 	// New methods for serial communication
     void startSerialThreads();

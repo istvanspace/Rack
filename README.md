@@ -52,66 +52,79 @@ VCV cannot accept free contributions to Rack itself, but we encourage you to
 - Work at VCV! Check job openings at <https://vcvrack.com/jobs>
 
 
-## DigiMod Version
-
 # Binary Encoding Protocol for Arduino Communication
 
-## Overview
+## DigiMod Version
 
+## Overview
 This repository contains the binary encoding protocol designed for efficient communication between multiple Arduinos and a Linux PC over separate USB connections. The protocol is streamlined to minimize data size and processing time, ensuring fast and reliable message transmission.
 
 ## Protocol Structure
-
-The protocol is structured to encode messages into a compact binary format. Each message includes a command ID, command type, and associated data such as model names, libraries, and response data.
+The protocol is structured to encode messages into a compact binary format. Each message includes start and end markers, message length, command ID, command type, and associated payload data.
 
 ### Message Format
-
 Each message follows this structure:
 
-1. **Command ID** (`command_id`): A 32-bit (4-byte) integer that uniquely identifies the command.
-2. **Command Type** (`command_type`): An 8-bit (1-byte) value that specifies the type of command (e.g., `init`, `start`, `stop`).
-3. **Model Name** (`model`): A dynamic UTF-8 string representing the model name, with a length prefix.
-4. **Library Name** (`library`): A dynamic UTF-8 string representing the library name, with a length prefix.
-5. **Response Data** (`response_data`): A dynamic payload containing the response, prefixed with a length.
+1. **Start Marker** (`START_MARKER`): A 1-byte value (0xFE) indicating the start of a message.
+2. **Message Length** (`message_length`): A 2-byte value indicating the length of the message (excluding start/end markers and length itself).
+3. **Command ID** (`command_id`): A 1-byte value that uniquely identifies the command.
+4. **Command Type** (`command_type`): A 1-byte value that specifies the type of command (e.g., `init`, `start`, `stop`).
+5. **Payload Length 1** (`payload1_length`): A 1-byte value indicating the length of the first payload.
+6. **Payload Length 2** (`payload2_length`): A 1-byte value indicating the length of the second payload.
+7. **Payload 1**: Variable length data (e.g., model name, or parameter_id).
+8. **Payload 2**: Variable length data (e.g., library name, or parameter_value).
+9. **End Marker** (`END_MARKER`): A 1-byte value (0xFF) indicating the end of a message.
 
 ### Encoding Details
-
-- **Command ID**: 4 bytes, unsigned integer.
+- **Start Marker**: 1 byte, fixed value 0xFE.
+- **Message Length**: 2 bytes, unsigned integer.
+- **Command ID**: 1 byte, unsigned integer.
 - **Command Type**: 1 byte.
-- **Model Name**:
-  - Length Prefix: 1 byte (up to 255 characters).
-  - UTF-8 encoded string.
-- **Library Name**:
-  - Length Prefix: 1 byte (up to 255 characters).
-  - UTF-8 encoded string.
-- **Response Data**:
-  - Length Prefix: 2 bytes (up to 65535 bytes).
-  - Raw binary data or UTF-8 encoded string.
+- **Payload Length 1**: 1 byte (up to 255 characters).
+- **Payload Length 2**: 1 byte (up to 255 characters).
+- **Payload 1**: Variable length, UTF-8 encoded string or raw data.
+- **Payload 2**: Variable length, UTF-8 encoded string or raw data.
+- **End Marker**: 1 byte, fixed value 0xFF.
 
 ### Example Encoding
-
 For a message with the following content:
-"command: (id: 1, init(model: VCO, library: Fundamental)); response: (id: 1, null)"
+"command: (id: 1, init(model: VCO, library: Fundamental))"
 
 The binary representation would be:
 
-In bytes:
-- **Command ID**: `0x00000001` (4 bytes).
-- **Command Type**: `0x01` (1 byte).
-- **Model Name**: `0x03` + "VCO" (4 bytes).
-- **Library Name**: `0x0B` + "Fundamental" (12 bytes).
-- **Response Data**: `0x0004` + "null" (6 bytes).
+```
+FE 00 12 01 01 03 0B 56 43 4F 46 75 6E 64 61 6D 65 6E 74 61 6C FF
+```
+
+Breakdown:
+- `FE`: Start Marker
+- `00 12`: Message Length (18 bytes)
+- `01`: Command ID
+- `01`: Command Type (init)
+- `03`: Payload 1 Length (3 bytes)
+- `0B`: Payload 2 Length (11 bytes)
+- `56 43 4F`: Payload 1 ("VCO")
+- `46 75 6E 64 61 6D 65 6E 74 61 6C`: Payload 2 ("Fundamental")
+- `FF`: End Marker
 
 ## Usage
 
 ### Sending Messages
-
-To send a message using this protocol, encode each field as specified and concatenate the bytes to form the complete binary message. Transmit the message over the serial connection associated with the Arduino.
+To send a message using this protocol:
+1. Construct the message according to the format above.
+2. Calculate the message length (excluding start/end markers and length itself).
+3. Encode each field as specified.
+4. Concatenate the bytes to form the complete binary message.
+5. Transmit the message over the serial connection.
 
 ### Receiving Messages
-
-To receive a message, read the incoming bytes, extract and decode each field according to the protocol structure. Handle the command based on the `command_id` and `command_type`.
+To receive a message:
+1. Read incoming bytes until the Start Marker (0xFE) is encountered.
+2. Read the next 2 bytes to determine the message length.
+3. Read the specified number of bytes.
+4. Verify the End Marker (0xFF).
+5. Decode the message fields according to the protocol structure.
+6. Handle the command based on the `command_id` and `command_type`.
 
 ## Contributing
-
 Contributions are welcome! Please feel free to submit a pull request or open an issue if you find bugs or have suggestions for improvements.

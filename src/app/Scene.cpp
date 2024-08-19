@@ -455,18 +455,21 @@ void Scene::serialAcknowledgment(serial::Serial& serial_port, const uint8_t* buf
     uint8_t responseBuffer[MAX_BUFFER_SIZE];
     uint8_t* ptr = responseBuffer;
 
-	*ptr++ = START_MARKER;
+    *ptr++ = START_MARKER;
+    
+    uint16_t messageLength = 4 + buffer[2] + buffer[3];  // 4 for commandId, commandType, and payload lengths
+    *ptr++ = (messageLength >> 8) & 0xFF;  // High byte of length
+    *ptr++ = messageLength & 0xFF;  // Low byte of length
+
     *ptr++ = buffer[0]; // Echo back the command ID
     *ptr++ = success ? 0x01 : 0x03; // 0x01 = Acknowledgment, 0x03 = Error
-    uint8_t payload1Length = buffer[2];
-    uint8_t payload2Length = buffer[3];
-    *ptr++ = payload1Length; // Payload 1 Length
-    *ptr++ = payload2Length; // Payload 2 Length
-    memcpy(ptr, buffer + 4, payload1Length); // Copy Payload 1
-    ptr += payload1Length;
-    memcpy(ptr, buffer + 4 + payload1Length, payload2Length); // Copy Payload 2
-    ptr += payload2Length;
-    *ptr++ = END_MARKER; // Append the End-of-Message marker
+    *ptr++ = buffer[2]; // Payload 1 Length
+    *ptr++ = buffer[3]; // Payload 2 Length
+    memcpy(ptr, buffer + 4, buffer[2]); // Copy Payload 1
+    ptr += buffer[2];
+    memcpy(ptr, buffer + 4 + buffer[2], buffer[3]); // Copy Payload 2
+    ptr += buffer[3];
+    *ptr++ = END_MARKER;
 
     size_t responseSize = ptr - responseBuffer;
 
@@ -478,7 +481,16 @@ void Scene::serialAcknowledgment(serial::Serial& serial_port, const uint8_t* buf
 
 void Scene::serialThread(std::string port) {
     try {
-        serial::Serial serial_port(port, 115200, serial::Timeout::simpleTimeout(500));
+        serial::Serial serial_port(port, 230400, serial::Timeout::simpleTimeout(500));
+		// Clear the serial buffer
+		if (serial_port.isOpen()) {
+			serial_port.flush(); // Clear any data in the output buffer (just in case)
+			
+			// Read and discard all available data from the input buffer
+			while (serial_port.available()) {
+				serial_port.read();
+			}
+		}
         const size_t MAX_BUFFER_SIZE = 256;
         uint8_t buffer[MAX_BUFFER_SIZE];
         size_t bufferIndex = 0;
@@ -523,7 +535,7 @@ void Scene::serialThread(std::string port) {
 
                             bool success = future.get();
                             INFO("Arduino command processed: success=%u", success);
-
+							
                             serialAcknowledgment(serial_port, buffer + 2, bufferIndex - 3, success);
                         } else {
                             WARN("Invalid END_MARKER received");
@@ -598,6 +610,23 @@ bool Scene::processMessage(const uint8_t* buffer, size_t size) {
                  payload1Str.c_str(), payload2Str.c_str());
             break;
         }
+		case 0x02:  // 'parameter update' command
+		{
+			std::lock_guard<std::mutex> lock(internal->taskMutex);
+			int paramId = std::stoi(payload1Str);
+            int rawValue = std::stoi(payload2Str);
+
+			// Hardcoded module ID (replace with actual module ID when available)
+            int64_t moduleId = 4; 
+
+			float normalizedValue = rawValue / 1023.0f;
+
+			success = updateModuleParameter(moduleId, paramId, normalizedValue);
+
+			INFO("VCO module added via Arduino command: payload1=%s, payload2=%s", 
+                 payload1Str.c_str(), payload2Str.c_str());
+			break;
+		}
         default:
             WARN("Unknown command type: %u", commandType);
             return false;
@@ -719,6 +748,53 @@ bool Scene::addVcoModule(const char* payload1, const char* payload2) {
     json_decref(rootJ);
 
     return success;  // Return success or failure
+}
+
+bool Scene::updateModuleParameter(int64_t moduleId, int paramId, float normalizedValue) {
+	rack::app::ModuleWidget* mw = APP->scene->rack->getModule(moduleId);
+	if (!mw) {
+		WARN("Module with id %lld not found", moduleId);
+		return false;
+	}
+
+	engine::Module* module = mw->getModule();
+	if (!module) {
+		WARN("Module instance not found for id %lld", moduleId);
+		return false;
+	}
+
+	if (paramId >= 0 && paramId < (int)module->params.size()) {
+		engine::ParamQuantity* pq = module->paramQuantities[paramId];
+		if (pq) {
+			// Store the old value for history
+			float oldValue = pq->getValue();
+			
+			// Transform normalizedValue to the parameter's actual range
+			float newValue = pq->getMinValue() + (pq->getMaxValue() - pq->getMinValue()) * normalizedValue;
+			
+			// Set the new value
+			pq->setValue(newValue);
+			
+			// Create a history action
+			history::ParamChange* h = new history::ParamChange;
+			h->name = "set parameter";
+			h->moduleId = moduleId;
+			h->paramId = paramId;
+			h->oldValue = oldValue;
+			h->newValue = newValue;
+			APP->history->push(h);
+
+			return true;
+		}
+		else {
+			WARN("ParamQuantity not found for module %lld, param %d", moduleId, paramId);
+		}
+	}
+	else {
+		WARN("Invalid parameter id %d for module %lld", paramId, moduleId);
+	}
+
+	return false;
 }
 
 
