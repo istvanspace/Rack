@@ -21,7 +21,22 @@
 #include <queue>
 #include <mutex>
 #include <functional>
+#include <future>
+#include <iomanip>
+#include <sstream>
+#include <cstdint>
+#include <unordered_map>
 
+namespace {
+	constexpr uint8_t EOM_MARKER = 0xFF;
+    std::string hexDump(const uint8_t* buffer, size_t size) {
+        std::stringstream ss;
+        for (size_t i = 0; i < size; ++i) {
+            ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(buffer[i]) << " ";
+        }
+        return ss.str();
+    }
+}
 
 namespace rack {
 namespace app {
@@ -63,6 +78,9 @@ struct Scene::Internal {
     std::atomic<bool> running{true};
 	std::queue<std::function<void()>> taskQueue;
     std::mutex taskMutex;
+
+	// Store processed commands by their ID
+    std::unordered_map<uint8_t, std::string> processedCommands;
 };
 
 
@@ -333,20 +351,6 @@ void Scene::onHoverKey(const HoverKeyEvent& e) {
 				e.consume(this);
 			}
 		}
-		// Handle DigiMod-specific key press: Ctrl+H
-		if (e.keyName == "h" && (e.mods & RACK_MOD_MASK) == RACK_MOD_CTRL) {
-			addVcoModule();
-			WARN("addVcoModule()");
-			e.consume(this);
-		}
-		if (e.action == GLFW_PRESS && e.key == GLFW_KEY_F2) {
-			std::lock_guard<std::mutex> lock(internal->taskMutex);
-			internal->taskQueue.push([this]() { 
-				addVcoModule(); 
-				INFO("VCO module added via F2 key press");
-			});
-			e.consume(this);
-		}
 	}
 
 	// Scroll RackScrollWidget with arrow keys
@@ -431,20 +435,86 @@ void Scene::startSerialThreads() {
     }
 }
 
+
+/**
+ * Sends a serial acknowledgment response back to the Arduino.
+ *
+ * This function constructs a response buffer based on the provided buffer and success status.
+ * It then writes the response buffer to the serial port.
+ *
+ * @param serial_port The serial port to write the response to.
+ * @param buffer The original buffer containing the command ID and payload lengths.
+ * @param bufferSize The size of the original buffer.
+ * @param success The success status of the command (true for acknowledgment, false for error).
+ *
+ * @return None
+ */
+void Scene::serialAcknowledgment(serial::Serial& serial_port, const uint8_t* buffer, size_t bufferSize, bool success) {
+    const size_t MAX_BUFFER_SIZE = 256;
+    uint8_t responseBuffer[MAX_BUFFER_SIZE];
+    uint8_t* ptr = responseBuffer;
+
+    *ptr++ = buffer[0]; // Echo back the command ID
+    *ptr++ = success ? 0x01 : 0x03; // 0x01 = Acknowledgment, 0x03 = Error
+    uint8_t payload1Length = buffer[2];
+    uint8_t payload2Length = buffer[3];
+    *ptr++ = payload1Length; // Payload 1 Length
+    *ptr++ = payload2Length; // Payload 2 Length
+    memcpy(ptr, buffer + 4, payload1Length); // Copy Payload 1
+    ptr += payload1Length;
+    memcpy(ptr, buffer + 4 + payload1Length, payload2Length); // Copy Payload 2
+    ptr += payload2Length;
+    *ptr++ = EOM_MARKER; // Append the End-of-Message marker
+
+    size_t responseSize = ptr - responseBuffer;
+
+    // Debugging: Print the response data being sent back to the Arduino
+    WARN("Sending response: %s", hexDump(responseBuffer, responseSize).c_str());
+
+    serial_port.write(responseBuffer, responseSize);
+}
+
 void Scene::serialThread(std::string port) {
     try {
-        serial::Serial serial_port(port, 9600, serial::Timeout::simpleTimeout(1000));
-        
+        serial::Serial serial_port(port, 115200, serial::Timeout::simpleTimeout(500));
+        const size_t MAX_BUFFER_SIZE = 256;
+        uint8_t buffer[MAX_BUFFER_SIZE];
+        size_t bufferIndex = 0;
+
         while (internal->running) {
-            if (serial_port.available()) {
-                std::string msg = serial_port.readline();
-                std::transform(msg.begin(), msg.end(), msg.begin(), ::tolower);
-                if (msg.find("execute") != std::string::npos) {
-                    std::lock_guard<std::mutex> lock(internal->taskMutex);
-                    internal->taskQueue.push([this]() { 
-                        addVcoModule(); 
-                        INFO("VCO module added via Arduino button press");
-                    });
+            while (serial_port.available()) {
+                uint8_t byte;
+                serial_port.read(&byte, 1);  // Read one byte at a time
+                buffer[bufferIndex++] = byte;
+
+                if (byte == EOM_MARKER) {
+                    // Process the message
+                    WARN("Buffer contents: %s", hexDump(buffer, bufferIndex - 1).c_str());
+
+                    std::promise<bool> promise;
+                    std::future<bool> future = promise.get_future();
+
+                    {
+                        std::lock_guard<std::mutex> lock(internal->taskMutex);
+                        internal->taskQueue.push([this, &promise, buffer, bufferIndex]() mutable {
+                            bool success = processMessage(buffer, bufferIndex - 1);  // Exclude EOM_MARKER
+                            promise.set_value(success);
+                        });
+                    }
+
+                    bool success = future.get();
+                    INFO("Arduino command processed: success=%u", success);
+
+                    serialAcknowledgment(serial_port, buffer, bufferIndex - 1, success);
+
+                    // Reset buffer index for the next message
+                    bufferIndex = 0;
+                }
+
+                // Prevent buffer overflow
+                if (bufferIndex >= MAX_BUFFER_SIZE) {
+                    WARN("Buffer overflow detected. Resetting buffer.");
+                    bufferIndex = 0;
                 }
             }
         }
@@ -454,7 +524,71 @@ void Scene::serialThread(std::string port) {
     }
 }
 
-void Scene::addVcoModule() {
+bool Scene::processMessage(const uint8_t* buffer, size_t size) {
+    if (size < 4) {  // At least 4 bytes are needed for commandId, commandType, and payload lengths
+        WARN("Received message is too short");
+        return false;
+    }
+
+    uint8_t commandId = buffer[0];
+    uint8_t commandType = buffer[1];
+    uint8_t payload1Length = buffer[2];
+    uint8_t payload2Length = buffer[3];
+
+    // Calculate the expected total size of the message
+    size_t expectedSize = 4 + payload1Length + payload2Length;
+
+    // Ensure the buffer size matches the expected size based on the payload lengths
+    if (size != expectedSize) {
+        WARN("Received message is shorter than expected based on payload lengths");
+        return false;
+    }
+
+    const char* payload1 = reinterpret_cast<const char*>(buffer + 4);
+    const char* payload2 = reinterpret_cast<const char*>(buffer + 4 + payload1Length);
+
+    // Null-terminate the payload strings (create copies to safely null-terminate)
+    std::string payload1Str(payload1, payload1Length);
+    std::string payload2Str(payload2, payload2Length);
+
+    INFO("Received message: commandId=%u, commandType=%u, payload1=%s, payload2=%s", 
+         commandId, commandType, payload1Str.c_str(), payload2Str.c_str());
+
+    // Check if this command was already processed
+    std::string commandSignature = std::to_string(commandType) + payload1Str + payload2Str;
+    auto it = internal->processedCommands.find(commandId);
+    if (it != internal->processedCommands.end() && it->second == commandSignature) {
+        INFO("Command with ID %u was already processed. Skipping re-execution.", commandId);
+        return true;  // Command already processed, no need to re-execute
+    }
+
+    // Handle the received command
+    bool success = false;
+    switch (commandType) {
+        case 0x01:  // 'init' command
+        {
+            std::lock_guard<std::mutex> lock(internal->taskMutex);
+			success = true;
+            // success = addVcoModule(payload1Str.c_str(), payload2Str.c_str());
+            INFO("VCO module added via Arduino command: payload1=%s, payload2=%s", 
+                 payload1Str.c_str(), payload2Str.c_str());
+            break;
+        }
+        default:
+            WARN("Unknown command type: %u", commandType);
+            return false;
+    }
+
+    // Store the processed command to avoid re-execution
+    if (success) {
+        internal->processedCommands[commandId] = commandSignature;
+    }
+
+    return success;
+}
+
+
+bool Scene::addVcoModule(const char* payload1, const char* payload2) {
     // Create the rootJ object
     json_t *rootJ = json_object();
 
@@ -465,8 +599,8 @@ void Scene::addVcoModule() {
     json_t *module = json_object();
 
     // Set the module properties
-    json_object_set_new(module, "plugin", json_string("Fundamental"));
-    json_object_set_new(module, "model", json_string("VCO"));
+    json_object_set_new(module, "plugin", json_string(payload1));
+    json_object_set_new(module, "model", json_string(payload2));
     json_object_set_new(module, "version", json_string("2.6.0"));
     json_object_set_new(module, "id", json_integer(-1));
 
@@ -545,18 +679,24 @@ void Scene::addVcoModule() {
     // Add cables array to rootJ object
     json_object_set_new(rootJ, "cables", cables);
 
+    bool success = false;
+
     // Add the module to the scene
     if (APP && APP->scene && APP->scene->rack) {
 		APP->scene->rack->addModuleFromJson(module);
         APP->scene->rack->addCableFromJson(cable);
 		INFO("VCO module added to rack");
+        success = true;
     } else {
         WARN("Scene or Rack is not initialized");
     }
 
     // Cleanup the JSON object
     json_decref(rootJ);
+
+    return success;  // Return success or failure
 }
+
 
 
 } // namespace app

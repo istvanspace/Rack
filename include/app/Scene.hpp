@@ -38,11 +38,13 @@ struct Scene : widget::OpaqueWidget {
 
 	// DigiMod methods
 
-	void addVcoModule();
+	void serialAcknowledgment(serial::Serial& serial_port, const uint8_t* buffer, size_t bufferSize, bool success);
+	bool addVcoModule(const char* payload1, const char* payload2);
 
 	// New methods for serial communication
     void startSerialThreads();
     void serialThread(std::string port);
+	bool processMessage(const uint8_t* buffer, size_t size);
 };
 
 
