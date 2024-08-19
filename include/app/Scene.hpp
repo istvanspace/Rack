@@ -4,6 +4,7 @@
 #include <app/RackScrollWidget.hpp>
 #include <app/RackWidget.hpp>
 #include <string>
+#include "serial/serial.h"
 
 
 namespace rack {

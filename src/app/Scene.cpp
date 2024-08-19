@@ -28,7 +28,8 @@
 #include <unordered_map>
 
 namespace {
-	constexpr uint8_t EOM_MARKER = 0xFF;
+	constexpr uint8_t START_MARKER = 0xFE;
+    constexpr uint8_t END_MARKER = 0xFF;
     std::string hexDump(const uint8_t* buffer, size_t size) {
         std::stringstream ss;
         for (size_t i = 0; i < size; ++i) {
@@ -454,6 +455,7 @@ void Scene::serialAcknowledgment(serial::Serial& serial_port, const uint8_t* buf
     uint8_t responseBuffer[MAX_BUFFER_SIZE];
     uint8_t* ptr = responseBuffer;
 
+	*ptr++ = START_MARKER;
     *ptr++ = buffer[0]; // Echo back the command ID
     *ptr++ = success ? 0x01 : 0x03; // 0x01 = Acknowledgment, 0x03 = Error
     uint8_t payload1Length = buffer[2];
@@ -464,7 +466,7 @@ void Scene::serialAcknowledgment(serial::Serial& serial_port, const uint8_t* buf
     ptr += payload1Length;
     memcpy(ptr, buffer + 4 + payload1Length, payload2Length); // Copy Payload 2
     ptr += payload2Length;
-    *ptr++ = EOM_MARKER; // Append the End-of-Message marker
+    *ptr++ = END_MARKER; // Append the End-of-Message marker
 
     size_t responseSize = ptr - responseBuffer;
 
@@ -480,40 +482,62 @@ void Scene::serialThread(std::string port) {
         const size_t MAX_BUFFER_SIZE = 256;
         uint8_t buffer[MAX_BUFFER_SIZE];
         size_t bufferIndex = 0;
+        bool messageStarted = false;
+        uint16_t expectedLength = 0;
 
         while (internal->running) {
             while (serial_port.available()) {
                 uint8_t byte;
-                serial_port.read(&byte, 1);  // Read one byte at a time
-                buffer[bufferIndex++] = byte;
+                serial_port.read(&byte, 1);
 
-                if (byte == EOM_MARKER) {
-                    // Process the message
-                    WARN("Buffer contents: %s", hexDump(buffer, bufferIndex - 1).c_str());
+                if (!messageStarted && byte == START_MARKER) {
+                    messageStarted = true;
+                    bufferIndex = 0;
+                    continue;
+                }
 
-                    std::promise<bool> promise;
-                    std::future<bool> future = promise.get_future();
+                if (messageStarted) {
+                    buffer[bufferIndex++] = byte;
 
-                    {
-                        std::lock_guard<std::mutex> lock(internal->taskMutex);
-                        internal->taskQueue.push([this, &promise, buffer, bufferIndex]() mutable {
-                            bool success = processMessage(buffer, bufferIndex - 1);  // Exclude EOM_MARKER
-                            promise.set_value(success);
-                        });
+                    if (bufferIndex == 2) {
+                        // First two bytes after START_MARKER represent message length
+                        expectedLength = (buffer[0] << 8) | buffer[1];
+                        continue;
                     }
 
-                    bool success = future.get();
-                    INFO("Arduino command processed: success=%u", success);
+                    if (bufferIndex == expectedLength + 3) {  // +3 for length bytes and END_MARKER
+                        if (byte == END_MARKER) {
+                            // Process the message
+                            WARN("Buffer contents: %s", hexDump(buffer, bufferIndex - 1).c_str());
 
-                    serialAcknowledgment(serial_port, buffer, bufferIndex - 1, success);
+                            std::promise<bool> promise;
+                            std::future<bool> future = promise.get_future();
 
-                    // Reset buffer index for the next message
-                    bufferIndex = 0;
+                            {
+                                std::lock_guard<std::mutex> lock(internal->taskMutex);
+                                internal->taskQueue.push([this, &promise, buffer, bufferIndex]() mutable {
+                                    bool success = processMessage(buffer + 2, bufferIndex - 3);  // Skip length bytes and END_MARKER
+                                    promise.set_value(success);
+                                });
+                            }
+
+                            bool success = future.get();
+                            INFO("Arduino command processed: success=%u", success);
+
+                            serialAcknowledgment(serial_port, buffer + 2, bufferIndex - 3, success);
+                        } else {
+                            WARN("Invalid END_MARKER received");
+                        }
+
+                        messageStarted = false;
+                        bufferIndex = 0;
+                    }
                 }
 
                 // Prevent buffer overflow
                 if (bufferIndex >= MAX_BUFFER_SIZE) {
                     WARN("Buffer overflow detected. Resetting buffer.");
+                    messageStarted = false;
                     bufferIndex = 0;
                 }
             }
