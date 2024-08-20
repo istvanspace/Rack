@@ -84,6 +84,8 @@ struct Scene::Internal {
 	// Flag to track when the window is fully initialized
     std::atomic<bool> windowInitialized{false};
 	std::atomic<int> stepCounter{0};
+
+	bool debug = false;  // Debug flag to control logging
 	
 };
 
@@ -470,7 +472,6 @@ void Scene::serialAcknowledgment(serial::Serial& serial_port, const uint8_t* buf
 
     size_t responseSize = ptr - responseBuffer;
 
-    // Debugging: Print the response data being sent back to the Arduino
     WARN("Sending response: %s", hexDump(responseBuffer, responseSize).c_str());
 
     serial_port.write(responseBuffer, responseSize);
@@ -479,6 +480,15 @@ void Scene::serialAcknowledgment(serial::Serial& serial_port, const uint8_t* buf
 void Scene::serialThread(std::string port) {
     try {
         serial::Serial serial_port(port, 230400, serial::Timeout::simpleTimeout(500));
+		// Clear the serial buffer
+		if (serial_port.isOpen()) {
+			serial_port.flush(); // Clear any data in the output buffer (just in case)
+
+			// Read and discard all available data from the input buffer
+			while (serial_port.available()) {
+				serial_port.read();
+			}
+		}
         const size_t MAX_BUFFER_SIZE = 256;
         uint8_t buffer[MAX_BUFFER_SIZE];
         size_t bufferIndex = 0;
@@ -507,8 +517,9 @@ void Scene::serialThread(std::string port) {
 
                     if (bufferIndex == expectedLength + 3) {  // +3 for length bytes and END_MARKER
                         if (byte == END_MARKER) {
-                            // Process the message
-                            WARN("Buffer contents: %s", hexDump(buffer, bufferIndex - 1).c_str());
+                            if (internal->debug) {
+								WARN("Buffer contents: %s", hexDump(buffer, bufferIndex - 1).c_str());
+							}
 
                             {
                                 // Capture serial_port by reference to use it in the lambda
@@ -575,8 +586,10 @@ bool Scene::processMessage(const uint8_t* buffer, size_t size, std::string port)
     std::string payload1Str(payload1, payload1Length);
     std::string payload2Str(payload2, payload2Length);
 
-    INFO("Received message: commandId=%u, commandType=%u, payload1=%s, payload2=%s", 
-         commandId, commandType, payload1Str.c_str(), payload2Str.c_str());
+    if (internal->debug) {
+		INFO("Received message: commandId=%u, commandType=%u, payload1=%s, payload2=%s", 
+			 commandId, commandType, payload1Str.c_str(), payload2Str.c_str());
+	}
 
     // Handle the received command
     bool success = false;
@@ -590,7 +603,10 @@ bool Scene::processMessage(const uint8_t* buffer, size_t size, std::string port)
 				std::lock_guard<std::mutex> lock(internal->processedCommandsMutex);
 				auto it = internal->processedCommands.find(commandId);
 				if (it != internal->processedCommands.end() && it->second == commandSignature) {
-					INFO("Command with ID %u was already processed. Skipping re-execution.", commandId);
+					if (internal->debug) {
+						INFO("Command with ID %u was already processed. Skipping re-execution.", commandId);
+					}
+					serialAcknowledgment(serial_port, buffer, size, success);
 					return true;  // Command already processed, no need to re-execute
 				}
 			}
