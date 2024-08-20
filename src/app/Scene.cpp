@@ -42,7 +42,6 @@ namespace {
 namespace rack {
 namespace app {
 
-
 struct ResizeHandle : widget::OpaqueWidget {
 	math::Vec size;
 
@@ -77,11 +76,15 @@ struct Scene::Internal {
 	// New members for serial communication
     std::vector<std::thread> serialThreads;
     std::atomic<bool> running{true};
-	std::queue<std::function<void()>> taskQueue;
+    std::queue<std::function<void()>> taskQueue;
     std::mutex taskMutex;
-
-	// Store processed commands by their ID
     std::unordered_map<uint8_t, std::string> processedCommands;
+    std::mutex processedCommandsMutex;
+
+	// Flag to track when the window is fully initialized
+    std::atomic<bool> windowInitialized{false};
+	std::atomic<int> stepCounter{0};
+	
 };
 
 
@@ -108,9 +111,6 @@ Scene::Scene() {
 	internal->resizeHandle->box.size = math::Vec(15, 15);
 	internal->resizeHandle->hide();
 	addChild(internal->resizeHandle);
-
-	// Start serial communication threads
-    startSerialThreads();
 }
 
 
@@ -200,6 +200,17 @@ void Scene::step() {
     }
 
 	Widget::step();
+
+	// Set windowInitialized to true after the first step
+    if (!internal->windowInitialized.load()) {
+        int currentStep = internal->stepCounter.fetch_add(1) + 1;
+        if (currentStep >= 30) {
+            internal->windowInitialized.store(true);
+            INFO("Window initialized after %d steps", currentStep);
+			// Start serial communication threads
+			startSerialThreads();
+        }
+    }
 }
 
 
@@ -436,20 +447,6 @@ void Scene::startSerialThreads() {
     }
 }
 
-
-/**
- * Sends a serial acknowledgment response back to the Arduino.
- *
- * This function constructs a response buffer based on the provided buffer and success status.
- * It then writes the response buffer to the serial port.
- *
- * @param serial_port The serial port to write the response to.
- * @param buffer The original buffer containing the command ID and payload lengths.
- * @param bufferSize The size of the original buffer.
- * @param success The success status of the command (true for acknowledgment, false for error).
- *
- * @return None
- */
 void Scene::serialAcknowledgment(serial::Serial& serial_port, const uint8_t* buffer, size_t bufferSize, bool success) {
     const size_t MAX_BUFFER_SIZE = 256;
     uint8_t responseBuffer[MAX_BUFFER_SIZE];
@@ -482,15 +479,6 @@ void Scene::serialAcknowledgment(serial::Serial& serial_port, const uint8_t* buf
 void Scene::serialThread(std::string port) {
     try {
         serial::Serial serial_port(port, 230400, serial::Timeout::simpleTimeout(500));
-		// Clear the serial buffer
-		if (serial_port.isOpen()) {
-			serial_port.flush(); // Clear any data in the output buffer (just in case)
-			
-			// Read and discard all available data from the input buffer
-			while (serial_port.available()) {
-				serial_port.read();
-			}
-		}
         const size_t MAX_BUFFER_SIZE = 256;
         uint8_t buffer[MAX_BUFFER_SIZE];
         size_t bufferIndex = 0;
@@ -522,21 +510,15 @@ void Scene::serialThread(std::string port) {
                             // Process the message
                             WARN("Buffer contents: %s", hexDump(buffer, bufferIndex - 1).c_str());
 
-                            std::promise<bool> promise;
-                            std::future<bool> future = promise.get_future();
-
                             {
+                                // Capture serial_port by reference to use it in the lambda
                                 std::lock_guard<std::mutex> lock(internal->taskMutex);
-                                internal->taskQueue.push([this, &promise, buffer, bufferIndex]() mutable {
-                                    bool success = processMessage(buffer + 2, bufferIndex - 3);  // Skip length bytes and END_MARKER
-                                    promise.set_value(success);
+								std::vector<uint8_t> bufferCopy(buffer, buffer + bufferIndex);
+								std::string portCopy = port;
+                                internal->taskQueue.push([this, portCopy, bufferCopy, bufferIndex]() mutable {
+                                    processMessage(bufferCopy.data() + 2, bufferIndex - 3, portCopy);
                                 });
                             }
-
-                            bool success = future.get();
-                            INFO("Arduino command processed: success=%u", success);
-							
-                            serialAcknowledgment(serial_port, buffer + 2, bufferIndex - 3, success);
                         } else {
                             WARN("Invalid END_MARKER received");
                         }
@@ -552,7 +534,7 @@ void Scene::serialThread(std::string port) {
                     messageStarted = false;
                     bufferIndex = 0;
                 }
-            }
+            }// Yield to allow other threads to run
         }
     }
     catch (serial::IOException& e) {
@@ -560,7 +542,13 @@ void Scene::serialThread(std::string port) {
     }
 }
 
-bool Scene::processMessage(const uint8_t* buffer, size_t size) {
+bool Scene::processMessage(const uint8_t* buffer, size_t size, std::string port) {
+	serial::Serial serial_port(port, 230400, serial::Timeout::simpleTimeout(500));
+	if (!internal->windowInitialized) {
+        WARN("Window not initialized. Ignoring message.");
+        return false;
+    }
+
     if (size < 4) {  // At least 4 bytes are needed for commandId, commandType, and payload lengths
         WARN("Received message is too short");
         return false;
@@ -590,51 +578,57 @@ bool Scene::processMessage(const uint8_t* buffer, size_t size) {
     INFO("Received message: commandId=%u, commandType=%u, payload1=%s, payload2=%s", 
          commandId, commandType, payload1Str.c_str(), payload2Str.c_str());
 
-    // Check if this command was already processed
-    std::string commandSignature = std::to_string(commandType) + payload1Str + payload2Str;
-    auto it = internal->processedCommands.find(commandId);
-    if (it != internal->processedCommands.end() && it->second == commandSignature) {
-        INFO("Command with ID %u was already processed. Skipping re-execution.", commandId);
-        return true;  // Command already processed, no need to re-execute
-    }
-
     // Handle the received command
     bool success = false;
     switch (commandType) {
         case 0x01:  // 'init' command
         {
+			// Check if this command was already processed
+			std::string commandSignature = std::to_string(commandId) + std::to_string(commandType) + payload1Str + payload2Str;
+			
+			{
+				std::lock_guard<std::mutex> lock(internal->processedCommandsMutex);
+				auto it = internal->processedCommands.find(commandId);
+				if (it != internal->processedCommands.end() && it->second == commandSignature) {
+					INFO("Command with ID %u was already processed. Skipping re-execution.", commandId);
+					return true;  // Command already processed, no need to re-execute
+				}
+			}
+
             std::lock_guard<std::mutex> lock(internal->taskMutex);
-			success = true;
-            // success = addVcoModule(payload1Str.c_str(), payload2Str.c_str());
+			// success = true;  // Assume success, replace with actual function call if needed
+            success = addVcoModule(payload1Str.c_str(), payload2Str.c_str());
             INFO("VCO module added via Arduino command: payload1=%s, payload2=%s", 
                  payload1Str.c_str(), payload2Str.c_str());
+
+            // Acknowledge only for 'init' command
+            serialAcknowledgment(serial_port, buffer, size, success);
+			internal->processedCommands[commandId] = commandSignature;
             break;
         }
-		case 0x02:  // 'parameter update' command
-		{
-			std::lock_guard<std::mutex> lock(internal->taskMutex);
-			int paramId = std::stoi(payload1Str);
-            int rawValue = std::stoi(payload2Str);
+        case 0x02:  // 'parameter update' command
+        {
+            try {
+				int paramId = std::stoi(payload1Str);
+				int rawValue = std::stoi(payload2Str);
+				int64_t moduleId = 4; // Hardcoded module ID
+				float normalizedValue = rawValue / 1023.0f;
 
-			// Hardcoded module ID (replace with actual module ID when available)
-            int64_t moduleId = 4; 
-
-			float normalizedValue = rawValue / 1023.0f;
-
-			success = updateModuleParameter(moduleId, paramId, normalizedValue);
-
-			INFO("VCO module added via Arduino command: payload1=%s, payload2=%s", 
-                 payload1Str.c_str(), payload2Str.c_str());
-			break;
-		}
+				// Apply the update immediately
+				updateModuleParameter(moduleId, paramId, normalizedValue);
+				success = true;
+			} catch (const std::invalid_argument& e) {
+				WARN("Failed to convert payload to integer: %s", e.what());
+				return false;
+			} catch (const std::out_of_range& e) {
+				WARN("Payload out of range for integer conversion: %s", e.what());
+				return false;
+			}
+            break;
+        }
         default:
             WARN("Unknown command type: %u", commandType);
             return false;
-    }
-
-    // Store the processed command to avoid re-execution
-    if (success) {
-        internal->processedCommands[commandId] = commandSignature;
     }
 
     return success;
@@ -751,50 +745,43 @@ bool Scene::addVcoModule(const char* payload1, const char* payload2) {
 }
 
 bool Scene::updateModuleParameter(int64_t moduleId, int paramId, float normalizedValue) {
-	rack::app::ModuleWidget* mw = APP->scene->rack->getModule(moduleId);
-	if (!mw) {
-		WARN("Module with id %lld not found", moduleId);
-		return false;
-	}
+    if (!APP || !APP->scene || !APP->scene->rack) {
+        WARN("Scene or Rack is not initialized - cannot update module parameter");
+        return false;
+    }
+    
+    rack::app::ModuleWidget* mw = APP->scene->rack->getModule(moduleId);
+    if (!mw || !mw->getModule()) {
+        WARN("Module with ID %ld not found", moduleId);
+        return false;
+    }
 
-	engine::Module* module = mw->getModule();
-	if (!module) {
-		WARN("Module instance not found for id %lld", moduleId);
-		return false;
-	}
+    engine::Module* module = mw->getModule();
+    if (paramId < 0 || paramId >= (int)module->params.size()) {
+        return false;
+    }
 
-	if (paramId >= 0 && paramId < (int)module->params.size()) {
-		engine::ParamQuantity* pq = module->paramQuantities[paramId];
-		if (pq) {
-			// Store the old value for history
-			float oldValue = pq->getValue();
-			
-			// Transform normalizedValue to the parameter's actual range
-			float newValue = pq->getMinValue() + (pq->getMaxValue() - pq->getMinValue()) * normalizedValue;
-			
-			// Set the new value
-			pq->setValue(newValue);
-			
-			// Create a history action
-			history::ParamChange* h = new history::ParamChange;
-			h->name = "set parameter";
-			h->moduleId = moduleId;
-			h->paramId = paramId;
-			h->oldValue = oldValue;
-			h->newValue = newValue;
-			APP->history->push(h);
+    engine::ParamQuantity* pq = module->paramQuantities[paramId];
+    if (!pq) {
+        return false;
+    }
 
-			return true;
-		}
-		else {
-			WARN("ParamQuantity not found for module %lld, param %d", moduleId, paramId);
-		}
-	}
-	else {
-		WARN("Invalid parameter id %d for module %lld", paramId, moduleId);
-	}
+    float oldValue = pq->getValue();
+    float newValue = pq->getMinValue() + (pq->getMaxValue() - pq->getMinValue()) * normalizedValue;
+    
+    // Apply all changes, no matter how small
+    pq->setValue(newValue);
 
-	return false;
+    // Create a history action for every change
+    history::ParamChange* h = new history::ParamChange;
+    h->name = "set parameter";
+    h->moduleId = moduleId;
+    h->paramId = paramId;
+    h->oldValue = oldValue;
+    h->newValue = newValue;
+    APP->history->push(h);
+
+    return true;
 }
 
 

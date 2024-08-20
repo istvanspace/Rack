@@ -46,7 +46,7 @@ struct Scene : widget::OpaqueWidget {
 	// New methods for serial communication
     void startSerialThreads();
     void serialThread(std::string port);
-	bool processMessage(const uint8_t* buffer, size_t size);
+	bool processMessage(const uint8_t* buffer, size_t size, std::string port);
 };
 
 
