@@ -30,6 +30,15 @@
 namespace {
 	constexpr uint8_t START_MARKER = 0xFE;
     constexpr uint8_t END_MARKER = 0xFF;
+	constexpr uint8_t COMMAND_TYPE_INITIALIZE = 0x01;
+	constexpr uint8_t COMMAND_TYPE_PARAMETER = 0x02;
+	constexpr uint8_t COMMAND_TYPE_CONNECTED = 0x03;
+	constexpr uint8_t COMMAND_TYPE_DISCONNECTED = 0x04;
+	constexpr uint8_t COMMAND_TYPE_MATCHED = 0x05;
+	constexpr uint8_t COMMAND_TYPE_ACKNOWLEDGEMENT = 0xFB;
+	constexpr uint8_t COMMAND_RESULT_SUCCESS = 0x01;
+	constexpr uint8_t COMMAND_RESULT_ERROR = 0x00;
+
     std::string hexDump(const uint8_t* buffer, size_t size) {
         std::stringstream ss;
         for (size_t i = 0; i < size; ++i) {
@@ -85,7 +94,9 @@ struct Scene::Internal {
     std::atomic<bool> windowInitialized{false};
 	std::atomic<int> stepCounter{0};
 
-	bool debug = false;  // Debug flag to control logging
+	std::atomic<bool> waitingForMatch{false};
+
+	bool debug = true;  // Debug flag to control logging
 	
 };
 
@@ -449,31 +460,34 @@ void Scene::startSerialThreads() {
     }
 }
 
-void Scene::serialAcknowledgment(serial::Serial& serial_port, const uint8_t* buffer, size_t bufferSize, bool success) {
+void Scene::serialSendCommand(serial::Serial& serial_port, const uint8_t* buffer, size_t bufferSize, uint8_t commandType,
+                                 const std::string& payload1, const std::string& payload2) {
     const size_t MAX_BUFFER_SIZE = 256;
     uint8_t responseBuffer[MAX_BUFFER_SIZE];
     uint8_t* ptr = responseBuffer;
 
     *ptr++ = START_MARKER;
-    
-    uint16_t messageLength = 4 + buffer[2] + buffer[3];  // 4 for commandId, commandType, and payload lengths
-    *ptr++ = (messageLength >> 8) & 0xFF;  // High byte of length
-    *ptr++ = messageLength & 0xFF;  // Low byte of length
+
+    uint16_t messageLength = 4 + payload1.length() + payload2.length(); // 4 for commandId, commandType, and payload lengths, 1 for uint8_t payload
+    *ptr++ = (messageLength >> 8) & 0xFF; // High byte of length
+    *ptr++ = messageLength & 0xFF; // Low byte of length
 
     *ptr++ = buffer[0]; // Echo back the command ID
-    *ptr++ = success ? 0x01 : 0x03; // 0x01 = Acknowledgment, 0x03 = Error
-    *ptr++ = buffer[2]; // Payload 1 Length
-    *ptr++ = buffer[3]; // Payload 2 Length
-    memcpy(ptr, buffer + 4, buffer[2]); // Copy Payload 1
-    ptr += buffer[2];
-    memcpy(ptr, buffer + 4 + buffer[2], buffer[3]); // Copy Payload 2
-    ptr += buffer[3];
+    *ptr++ = COMMAND_TYPE_ACKNOWLEDGEMENT;
+
+    *ptr++ = payload1.length(); // Payload 1 Length
+    *ptr++ = payload2.length(); // Payload 2 Length
+
+	memcpy(ptr, payload1.c_str(), payload1.length()); // Copy Payload 1
+    ptr += payload1.length();
+
+    memcpy(ptr, payload2.c_str(), payload2.length()); // Copy Payload 2
+    ptr += payload2.length();
+
     *ptr++ = END_MARKER;
 
     size_t responseSize = ptr - responseBuffer;
-
     WARN("Sending response: %s", hexDump(responseBuffer, responseSize).c_str());
-
     serial_port.write(responseBuffer, responseSize);
 }
 
@@ -494,6 +508,11 @@ void Scene::serialThread(std::string port) {
         size_t bufferIndex = 0;
         bool messageStarted = false;
         uint16_t expectedLength = 0;
+
+        std::vector<uint8_t> latestBuffer;
+        size_t latestBufferIndex = 0;
+        std::string latestPortCopy;
+        bool taskInProgress = false;
 
         while (internal->running) {
             while (serial_port.available()) {
@@ -522,12 +541,21 @@ void Scene::serialThread(std::string port) {
 							}
 
                             {
-                                // Capture serial_port by reference to use it in the lambda
                                 std::lock_guard<std::mutex> lock(internal->taskMutex);
-								std::vector<uint8_t> bufferCopy(buffer, buffer + bufferIndex);
-								std::string portCopy = port;
-                                internal->taskQueue.push([this, portCopy, bufferCopy, bufferIndex]() mutable {
-                                    processMessage(bufferCopy.data() + 2, bufferIndex - 3, portCopy);
+                                // Store the latest message
+                                latestBuffer.assign(buffer, buffer + bufferIndex);
+                                latestBufferIndex = bufferIndex;
+                                latestPortCopy = port;
+                            }
+
+                            if (!taskInProgress) {
+                                // If no task is in progress, add the latest message as a task
+                                std::lock_guard<std::mutex> lock(internal->taskMutex);
+                                taskInProgress = true;
+
+                                internal->taskQueue.push([this, &taskInProgress, latestPortCopy, latestBuffer, latestBufferIndex]() mutable {
+                                    processMessage(latestBuffer.data() + 2, latestBufferIndex - 3, latestPortCopy);
+                                    taskInProgress = false;  // Mark task as completed
                                 });
                             }
                         } else {
@@ -575,7 +603,7 @@ bool Scene::processMessage(const uint8_t* buffer, size_t size, std::string port)
 
     // Ensure the buffer size matches the expected size based on the payload lengths
     if (size != expectedSize) {
-        WARN("Received message is shorter than expected based on payload lengths");
+        WARN("Received message size mismatch: expected %zu, got %zu", expectedSize, size);
         return false;
     }
 
@@ -592,9 +620,8 @@ bool Scene::processMessage(const uint8_t* buffer, size_t size, std::string port)
 	}
 
     // Handle the received command
-    bool success = false;
     switch (commandType) {
-        case 0x01:  // 'init' command
+        case COMMAND_TYPE_INITIALIZE:  // 'init' command
         {
 			// Check if this command was already processed
 			std::string commandSignature = std::to_string(commandId) + std::to_string(commandType) + payload1Str + payload2Str;
@@ -606,23 +633,25 @@ bool Scene::processMessage(const uint8_t* buffer, size_t size, std::string port)
 					if (internal->debug) {
 						INFO("Command with ID %u was already processed. Skipping re-execution.", commandId);
 					}
-					serialAcknowledgment(serial_port, buffer, size, success);
+					std::string result(1, static_cast<char>(COMMAND_RESULT_SUCCESS));
+					serialSendCommand(serial_port, buffer, size, COMMAND_TYPE_ACKNOWLEDGEMENT, result, "");
+
 					return true;  // Command already processed, no need to re-execute
 				}
 			}
 
             std::lock_guard<std::mutex> lock(internal->taskMutex);
-			// success = true;  // Assume success, replace with actual function call if needed
-            success = addVcoModule(payload1Str.c_str(), payload2Str.c_str());
+			std::string result(1, static_cast<char>(COMMAND_RESULT_SUCCESS));  // Assume success, replace with actual function call if needed
+            // std::string result = addNewModule(payload1Str.c_str(), payload2Str.c_str());
             INFO("VCO module added via Arduino command: payload1=%s, payload2=%s", 
                  payload1Str.c_str(), payload2Str.c_str());
 
             // Acknowledge only for 'init' command
-            serialAcknowledgment(serial_port, buffer, size, success);
+            serialSendCommand(serial_port, buffer, size, COMMAND_TYPE_ACKNOWLEDGEMENT, result, "");
 			internal->processedCommands[commandId] = commandSignature;
             break;
         }
-        case 0x02:  // 'parameter update' command
+        case COMMAND_TYPE_PARAMETER:  // 'parameter update' command
         {
             try {
 				int paramId = std::stoi(payload1Str);
@@ -631,8 +660,10 @@ bool Scene::processMessage(const uint8_t* buffer, size_t size, std::string port)
 				float normalizedValue = rawValue / 1023.0f;
 
 				// Apply the update immediately
+				if (paramId == 1) {
+					paramId = 2;
+				}
 				updateModuleParameter(moduleId, paramId, normalizedValue);
-				success = true;
 			} catch (const std::invalid_argument& e) {
 				WARN("Failed to convert payload to integer: %s", e.what());
 				return false;
@@ -642,16 +673,84 @@ bool Scene::processMessage(const uint8_t* buffer, size_t size, std::string port)
 			}
             break;
         }
+		case COMMAND_TYPE_CONNECTED:  // 'connected' command
+		{
+			if (!internal->waitingForMatch) {
+				INFO("Jack connected. Waiting for match.");
+				std::string result(1, static_cast<char>(COMMAND_RESULT_SUCCESS));
+				serialSendCommand(serial_port, buffer, size, COMMAND_TYPE_ACKNOWLEDGEMENT, result, "");
+				internal->waitingForMatch = true;
+				break;
+			} else {
+				INFO("Jack connected. Match found.");
+				std::string result(1, static_cast<char>(COMMAND_RESULT_SUCCESS));
+				serialSendCommand(serial_port, buffer, size, COMMAND_TYPE_MATCHED, result,"");
+				internal->waitingForMatch = false;
+				break;
+			}
+			
+		}
+		case COMMAND_TYPE_DISCONNECTED:  // 'disconnected' command
+		{	
+			if (internal->waitingForMatch) {
+				INFO("Jack disconnected before match was made: Cable removed.");
+			} else {
+				INFO("Jack disconnected. Waiting for match: Cable partially connected, dangling.");
+			}
+			
+			internal->waitingForMatch = !internal->waitingForMatch;
+			std::string result(1, static_cast<char>(COMMAND_RESULT_SUCCESS));
+			serialSendCommand(serial_port, buffer, size, COMMAND_TYPE_ACKNOWLEDGEMENT, result, "");
+			break;
+		}
         default:
             WARN("Unknown command type: %u", commandType);
             return false;
     }
 
-    return success;
+    return true;
 }
 
 
-bool Scene::addVcoModule(const char* payload1, const char* payload2) {
+std::string Scene::addNewCable(const char* payload1, const char* payload2) {
+	// Create the rootJ object
+    json_t *rootJ = json_object();
+
+	// Create an empty cables array and add it to rootJ object
+    json_t *cables = json_array();
+
+    // Create a new cable object
+    json_t *cable = json_object();
+    json_object_set_new(cable, "id", json_integer(-1));
+    json_object_set_new(cable, "outputModuleId", json_integer(2));
+    json_object_set_new(cable, "outputId", json_integer(0));
+    json_object_set_new(cable, "inputModuleId", json_integer(7));
+    json_object_set_new(cable, "inputId", json_integer(1));
+    json_object_set_new(cable, "color", json_string("#f3374b"));
+    json_array_append_new(cables, cable);
+
+    // Add cables array to rootJ object
+    json_object_set_new(rootJ, "cables", cables);
+
+    uint8_t success = COMMAND_RESULT_ERROR;
+
+    // Add the module to the scene
+    if (APP && APP->scene && APP->scene->rack) {
+        APP->scene->rack->addCableFromJson(cable);
+		INFO("VCO module added to rack");
+        success = COMMAND_RESULT_SUCCESS;
+    } else {
+        WARN("Scene or Rack is not initialized");
+    }
+
+    // Cleanup the JSON object
+    json_decref(rootJ);
+
+	std::string result(1, static_cast<char>(success));
+    return result;
+}
+
+std::string Scene::addNewModule(const char* payload1, const char* payload2) {
     // Create the rootJ object
     json_t *rootJ = json_object();
 
@@ -726,30 +825,30 @@ bool Scene::addVcoModule(const char* payload1, const char* payload2) {
     // Add modules array to rootJ object
     json_object_set_new(rootJ, "modules", modules);
 
-    // Create an empty cables array and add it to rootJ object
-    json_t *cables = json_array();
+    // // Create an empty cables array and add it to rootJ object
+    // json_t *cables = json_array();
 
-    // Create a new cable object
-    json_t *cable = json_object();
-    json_object_set_new(cable, "id", json_integer(-1));
-    json_object_set_new(cable, "outputModuleId", json_integer(2));
-    json_object_set_new(cable, "outputId", json_integer(0));
-    json_object_set_new(cable, "inputModuleId", json_integer(7));
-    json_object_set_new(cable, "inputId", json_integer(1));
-    json_object_set_new(cable, "color", json_string("#f3374b"));
-    json_array_append_new(cables, cable);
+    // // Create a new cable object
+    // json_t *cable = json_object();
+    // json_object_set_new(cable, "id", json_integer(-1));
+    // json_object_set_new(cable, "outputModuleId", json_integer(2));
+    // json_object_set_new(cable, "outputId", json_integer(0));
+    // json_object_set_new(cable, "inputModuleId", json_integer(7));
+    // json_object_set_new(cable, "inputId", json_integer(1));
+    // json_object_set_new(cable, "color", json_string("#f3374b"));
+    // json_array_append_new(cables, cable);
 
-    // Add cables array to rootJ object
-    json_object_set_new(rootJ, "cables", cables);
+    // // Add cables array to rootJ object
+    // json_object_set_new(rootJ, "cables", cables);
 
-    bool success = false;
+    uint8_t success = COMMAND_RESULT_ERROR;
 
     // Add the module to the scene
     if (APP && APP->scene && APP->scene->rack) {
 		APP->scene->rack->addModuleFromJson(module);
-        APP->scene->rack->addCableFromJson(cable);
+        // APP->scene->rack->addCableFromJson(cable);
 		INFO("VCO module added to rack");
-        success = true;
+        success = COMMAND_RESULT_SUCCESS;
     } else {
         WARN("Scene or Rack is not initialized");
     }
@@ -757,7 +856,8 @@ bool Scene::addVcoModule(const char* payload1, const char* payload2) {
     // Cleanup the JSON object
     json_decref(rootJ);
 
-    return success;  // Return success or failure
+	std::string result(1, static_cast<char>(success));
+    return result;
 }
 
 bool Scene::updateModuleParameter(int64_t moduleId, int paramId, float normalizedValue) {

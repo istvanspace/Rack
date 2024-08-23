@@ -39,8 +39,10 @@ struct Scene : widget::OpaqueWidget {
 
 	// DigiMod methods
 
-	void serialAcknowledgment(serial::Serial& serial_port, const uint8_t* buffer, size_t bufferSize, bool success);
-	bool addVcoModule(const char* payload1, const char* payload2);
+	void serialSendCommand(serial::Serial& serial_port, const uint8_t* buffer, size_t bufferSize, uint8_t commandType,
+                                 const std::string& payload1, const std::string& payload2);
+	std::string addNewModule(const char* payload1, const char* payload2);
+	std::string addNewCable(const char* payload1, const char* payload2);
 	bool updateModuleParameter(int64_t moduleId, int paramId, float normalizedValue);
 
 	// New methods for serial communication
